@@ -1,0 +1,93 @@
+{
+  "_comment": "Two cards, each with its own background job (gpu-batch@N.service: training, rendering, mining - whatever should use the card while no model does). Big MoE models one at a time on card 0 (or on both); small ones prefer card 1, so they can run beside a big one. Backends: llama.cpp server and vLLM.",
+
+  "cards": {
+    "0": {"background": {"unit": "gpu-batch@0.service"}},
+    "1": {"background": {"unit": "gpu-batch@1.service"}}
+  },
+
+  "gpu": {"free_threshold_mib": 2000, "free_wait_sec": 120},
+
+  "policy": {"max_big": 1, "budget_minutes_per_hour": 0, "evict_grace_sec": 15, "host_mem_limit_gib": 480},
+
+  "defaults": {"idle_minutes": 3, "start_timeout_sec": 900},
+
+  "models": {
+    "big-moe": {
+      "desc": "Large MoE, llama.cpp: attention on card 0, experts in host RAM",
+      "class": "big",
+      "gpus": [0],
+      "exec": ["/usr/local/bin/llama-server", "-m", "/opt/models/big-moe/big-moe-Q3_K_M-00001-of-00004.gguf",
+               "--host", "127.0.0.1", "--port", "8301", "-c", "65536", "-ngl", "99",
+               "-ot", "ffn_.*_exps\\.=CPU", "--threads", "64"],
+      "user": "llm",
+      "properties": ["TimeoutStopSec=120"],
+      "env": {"CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": "{card}"},
+      "health_url": "http://127.0.0.1:8301/health",
+      "busy_url": "http://127.0.0.1:8301/slots",
+      "aliases": ["big"],
+      "host_mem_gib": 300,
+      "requires": ["/opt/models/big-moe/big-moe-Q3_K_M-00001-of-00004.gguf"]
+    },
+    "big-tp2": {
+      "desc": "Large model on both cards, vLLM tensor parallel",
+      "class": "big",
+      "gpus": "all",
+      "exec": ["/opt/vllm/bin/vllm", "serve", "/opt/models/big-tp2", "--served-model-name", "big-tp2",
+               "--host", "127.0.0.1", "--port", "8302", "--tensor-parallel-size", "2"],
+      "user": "llm",
+      "properties": ["TimeoutStopSec=120"],
+      "env": {"CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": "{cards}"},
+      "health_url": "http://127.0.0.1:8302/health",
+      "api": ["openai"],
+      "host_mem_gib": 60,
+      "start_timeout_sec": 1200
+    },
+    "small-chat": {
+      "desc": "Small chat model, llama.cpp, prefers card 1",
+      "class": "small",
+      "gpus": [1, 0],
+      "exec": ["/usr/local/bin/llama-server", "-m", "/opt/models/small-chat-Q4_K_M.gguf",
+               "--host", "127.0.0.1", "--port", "8303", "-ngl", "99", "-c", "32768", "--parallel", "4"],
+      "user": "llm",
+      "env": {"CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": "{card}"},
+      "health_url": "http://127.0.0.1:8303/health",
+      "busy_url": "http://127.0.0.1:8303/slots",
+      "aliases": ["chat"],
+      "host_mem_gib": 8
+    },
+    "small-coder": {
+      "desc": "Small coder, vLLM with sleep mode (dev endpoints): idle -> sleep, next request -> wake",
+      "class": "small",
+      "gpus": [1, 0],
+      "exec": ["/opt/vllm/bin/vllm", "serve", "/opt/models/small-coder", "--served-model-name", "small-coder",
+               "--host", "127.0.0.1", "--port", "8304", "--enable-sleep-mode"],
+      "user": "llm",
+      "env": {"CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": "{card}", "VLLM_SERVER_DEV_MODE": "1"},
+      "health_url": "http://127.0.0.1:8304/health",
+      "api": ["openai"],
+      "sleep": {"sleep_url": "http://127.0.0.1:8304/sleep?level=1", "wake_url": "http://127.0.0.1:8304/wake_up",
+                "release_minutes": 120},
+      "_sleep_note": "a sleeping server keeps its CUDA context; if that is above gpu.free_threshold_mib, cardshare stops it instead",
+      "aliases": ["coder"],
+      "host_mem_gib": 40
+    }
+  },
+
+  "aliases": {
+    "gpt-4o-mini": "small-chat"
+  },
+
+  "gateway": {
+    "host": "127.0.0.1",
+    "port": 8100,
+    "allowed_hosts": [],
+    "api_key_file": null,
+    "queue_timeout_sec": 600,
+    "request_log": "/var/log/cardshare/requests.jsonl",
+    "client_classes": [
+      {"name": "agent", "match": {"header": {"User-Agent": "claude-cli|codex|aider|opencode"}}, "idle_minutes": 2},
+      {"name": "chat", "idle_minutes": 3}
+    ]
+  }
+}

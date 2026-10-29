@@ -1,0 +1,40 @@
+{
+  "_comment": "Minimal: one card, a background job that uses it while no model does, two llama.cpp models started on demand.",
+
+  "cards": {
+    "0": {"background": {"unit": "gpu-batch.service"}}
+  },
+
+  "defaults": {"idle_minutes": 3},
+
+  "models": {
+    "qwen-coder": {
+      "desc": "Qwen coder, llama.cpp",
+      "gpus": [0],
+      "exec": ["/usr/local/bin/llama-server", "-m", "/srv/models/qwen-coder-q4_k_m.gguf",
+               "--host", "127.0.0.1", "--port", "8201", "-ngl", "99", "-c", "32768"],
+      "user": "llm",
+      "env": {"CUDA_VISIBLE_DEVICES": "{card}"},
+      "health_url": "http://127.0.0.1:8201/health",
+      "busy_url": "http://127.0.0.1:8201/slots",
+      "aliases": ["coder"]
+    },
+    "llama-chat": {
+      "desc": "General chat model, llama.cpp",
+      "gpus": [0],
+      "exec": ["/usr/local/bin/llama-server", "-m", "/srv/models/chat-q4_k_m.gguf",
+               "--host", "127.0.0.1", "--port", "8202", "-ngl", "99"],
+      "user": "llm",
+      "env": {"CUDA_VISIBLE_DEVICES": "{card}"},
+      "health_url": "http://127.0.0.1:8202/health",
+      "busy_url": "http://127.0.0.1:8202/slots",
+      "idle_minutes": 10
+    }
+  },
+
+  "gateway": {
+    "host": "127.0.0.1",
+    "port": 8100,
+    "request_log": "/var/log/cardshare/requests.jsonl"
+  }
+}

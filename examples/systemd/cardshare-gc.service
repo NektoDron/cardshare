@@ -1,0 +1,7 @@
+[Unit]
+Description=cardshare gc: idle models give their cards back
+
+[Service]
+Type=oneshot
+Environment=CARDSHARE_CONFIG=/etc/cardshare/config.json
+ExecStart=/opt/cardshare/bin/cardshare gc

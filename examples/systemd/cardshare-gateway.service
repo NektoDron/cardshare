@@ -1,0 +1,20 @@
+[Unit]
+Description=cardshare gateway: OpenAI/Anthropic API that brings models up on demand
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# An unprivileged user; it asks the arbiter through `sudo -n cardshare ...` (see docs/install.md).
+User=cardshare
+Environment=CARDSHARE_CONFIG=/etc/cardshare/config.json
+ExecStart=/opt/cardshare/bin/cardshare gateway
+# /run/cardshare: activity leases the arbiter reads (owned by User=, kept across restarts)
+RuntimeDirectory=cardshare
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
