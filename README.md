@@ -137,7 +137,9 @@ backends, a model on both cards, a model with sleep mode).
       "upstream_headers": {},                         // e.g. a backend key
       "idle_minutes": 3, "sleep": false, "host_mem_gib": 0,
       "requires": ["/m/coder.gguf"],                  // hidden from the API while missing
-      "hidden": false
+      "hidden": false,                               // true also rejects generation requests
+      "listed": true,                                // false omits this model and aliases from GET /v1/models only
+      "context_window": 65536                        // optional: actual backend capacity, a positive integer
     }
   },
 
@@ -163,6 +165,19 @@ backends, a model on both cards, a model with sleep mode).
   }
 }
 ```
+
+Set a model's `listed` to `false` to keep it out of the OpenAI and Anthropic model
+catalogs while still allowing generation by its canonical name or aliases. The
+default is `true`. This does not change the administrative CLI model list or
+explicit `GET /v1/models/{id}` lookup. Use `hidden: true` to make a model unavailable
+through the API altogether.
+
+`context_window` optionally declares the backend's actual configured context capacity.
+It appears as a top-level field in OpenAI and Anthropic model catalogs and explicit
+model lookups, including aliases. Unknown capacities are omitted; cardshare does not
+guess a default or contact/start a backend during discovery. Set this to the deployed
+backend limit, not the model architecture's larger theoretical maximum. This metadata
+does not change the backend's context allocation.
 
 Placeholders `{name}`, `{card}` (the first chosen card) and `{cards}` (`0,1`) are filled in unit names,
 commands, `env` values and URLs. Nothing else is touched, so `${VAR}` in a command stays as it is.

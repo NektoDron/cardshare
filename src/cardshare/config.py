@@ -183,6 +183,10 @@ class Model:
         self.api = list(api)
         self.requires = [str(p) for p in raw.get("requires", [])]
         self.hidden = bool(raw.get("hidden", False))
+        self.listed = bool(raw.get("listed", True))
+        self.context_window = raw.get("context_window")
+        if "context_window" in raw and (type(self.context_window) is not int or self.context_window <= 0):
+            raise ConfigError("models.%s.context_window: expected a positive integer" % name)
         # Sleep instead of stop on idle: the server frees the card but keeps the process (and its
         # host memory), so waking is much faster than a cold start.  Off by default.
         sl = raw.get("sleep", defaults.get("sleep", False))
