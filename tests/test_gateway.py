@@ -6,15 +6,17 @@ import os
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 from fakes import FakeHost, StubBackend, TmpDir, free_port, model, two_card_config
 
 try:
+    from aiohttp import web
     from aiohttp.test_utils import TestClient, TestServer
 
     from cardshare.activity import read_lease
     from cardshare.arbiter import Arbiter
-    from cardshare.gateway import Gateway, InProcessArbiter
+    from cardshare.gateway import Gateway, InProcessArbiter, run
 except ImportError:                              # aiohttp is optional
     TestClient = None
 
@@ -59,7 +61,7 @@ class GatewayBase(unittest.IsolatedAsyncioTestCase):
             self.host.on_start[n] = lambda cards, s=s: s.start()
             self.host.on_stop[n] = s.stop
         self.gw = Gateway(self.cfg, InProcessArbiter(self.cfg, self.host), host=self.host)
-        self.client = TestClient(TestServer(self.gw.app()))
+        self.client = TestClient(TestServer(self.gw.app(), handler_cancellation=True))
         await self.client.start_server()
 
     async def asyncTearDown(self):
@@ -286,6 +288,86 @@ class Failures(GatewayBase):
 
 
 class Leases(GatewayBase):
+    def test_runner_cancels_disconnected_handlers(self):
+        with patch("cardshare.gateway.logging.basicConfig"), patch("cardshare.gateway.web.run_app") as serve:
+            run(self.cfg)
+        self.assertTrue(serve.call_args.kwargs["handler_cancellation"])
+
+    async def test_cold_disconnect_does_not_cancel_shared_model_start(self):
+        self.stubs["smallA"].load_delay = 0.3
+        abort = await self.chat("smallA", stream=True)
+        peer = await self.chat("smallA", stream=True)
+        for response in (abort, peer):
+            self.assertIn(b"starting smallA", await response.content.readline())
+        self.assertEqual(self.gw.inflight["smallA"], 2)
+        abort.close()
+        await self.wait_for(lambda: self.gw.inflight["smallA"] == 1)
+        self.assertFalse(self.gw.pending["smallA"].cancelled())
+        body = await asyncio.wait_for(peer.read(), 3)
+        self.assertIn(b"[DONE]", body)
+        self.assertEqual(self.starts("smallA"), 1)
+        await self.wait_for(lambda: self.gw.inflight["smallA"] == 0)
+
+    async def test_disconnect_cancels_quiet_upstream_and_preserves_peer(self):
+        # Real TCP at both hops. The backend sends one chunk, then stays quiet:
+        # cancellation must not wait for another token or a read timeout.
+        disconnected = {name: asyncio.Event() for name in ("abort", "peer")}
+        finish_peer = asyncio.Event()
+        closed_at = {}
+        loop = asyncio.get_running_loop()
+
+        async def backend(request):
+            name = (await request.json())["test_request"]
+            response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+            await response.prepare(request)
+            await response.write(b"data: first\n\n")
+            try:
+                if name == "peer":
+                    await finish_peer.wait()
+                    await response.write(b"data: [DONE]\n\n")
+                    await response.write_eof()
+                    return response
+                await asyncio.Event().wait()
+            finally:
+                closed_at[name] = loop.time()
+                disconnected[name].set()
+
+        app = web.Application()
+        app.router.add_post("/v1/chat/completions", backend)
+        upstream = TestServer(app, handler_cancellation=True)
+        await upstream.start_server()
+        info = {"cards": ["1"], "api_url": str(upstream.make_url("/"))}
+        try:
+            with patch.object(self.gw, "ready_info", return_value=info):
+                abort, peer = await asyncio.gather(*[
+                    self.client.post("/v1/chat/completions", json={
+                        "model": "smallA", "stream": True, "test_request": name})
+                    for name in ("abort", "peer")])
+                for response in (abort, peer):
+                    self.assertEqual(await response.content.readuntil(b"\n\n"), b"data: first\n\n")
+                self.assertEqual(self.gw.inflight["smallA"], 2)
+                started = loop.time()
+                abort.close()
+                await asyncio.wait_for(disconnected["abort"].wait(), 0.5)
+                latency_ms = (closed_at["abort"] - started) * 1000
+                print("quiet-upstream disconnect observed: %.3f ms" % latency_ms)
+                # A generous correctness bound avoids making host scheduler load
+                # a performance test. Report actual timings separately.
+                self.assertLess(latency_ms, 500)
+                self.assertEqual(self.gw.inflight["smallA"], 1)
+                active, _, _ = read_lease(self.cfg.run_dir, "smallA", time.time(), 60)
+                self.assertEqual(active, 1)
+                self.assertFalse(disconnected["peer"].is_set())
+                finish_peer.set()
+                self.assertIn(b"[DONE]", await asyncio.wait_for(peer.read(), 0.5))
+                await self.wait_for(lambda: self.gw.inflight["smallA"] == 0)
+                active, _, _ = read_lease(self.cfg.run_dir, "smallA", time.time(), 60)
+                self.assertEqual(active, 0)
+                self.assertEqual(sorted(x["status"] for x in self.log_lines()), [200, 499])
+        finally:
+            finish_peer.set()
+            await upstream.close()
+
     async def test_gc_does_not_stop_a_model_mid_request(self):
         self.cfg.models["smallA"].idle_minutes = 0.002         # 0.12 s
         await self.chat("smallA")
