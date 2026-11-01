@@ -376,6 +376,129 @@ class SharedBackground(Base):
 class Sleep(Base):
     models = dict(default_models(), sleepy=model(9300, "big", [0], sleep=True, idle_minutes=1))
 
+    def test_freed_sleeper_inserted_after_awake_model_is_not_gpu_owner(self):
+        self.cfg.models["smallA"].gpus = ["0"]
+        self.arb.up("sleepy")
+        self.arb.sleep_model("sleepy")
+        self.arb.up("smallA")
+        st = self.state()
+        # Reproduce the misleading order: a retained sleeper is serialized last.
+        st["models"]["sleepy"] = st["models"].pop("sleepy")
+        self.arb.save_state(st)
+        with open(self.cfg.state_file) as fh:
+            saved = json.load(fh)
+        self.assertEqual(saved["slots"]["0"], "smallA")
+        self.assertEqual(saved["active"], "smallA")
+        status = self.arb.status()
+        self.assertEqual(status["cards"]["0"]["model"], "smallA")
+        self.assertEqual(status["models"]["sleepy"]["state"], "asleep")
+
+    def test_only_freeing_sleeper_has_no_gpu_owner_or_legacy_active(self):
+        self.arb.up("sleepy")
+        self.arb.sleep_model("sleepy")
+        with open(self.cfg.state_file) as fh:
+            saved = json.load(fh)
+        self.assertEqual(saved["slots"], {"0": None, "1": None})
+        self.assertIsNone(saved["active"])
+        status = self.arb.status()
+        self.assertIsNone(status["cards"]["0"]["model"])
+        self.assertEqual(status["cards"]["0"]["background"], "running")
+        self.assertIn("sleepy", status["models"])
+
+    def test_holding_sleeper_remains_gpu_owner_and_legacy_active(self):
+        self.cfg.models["sleepy"].sleep["frees_card"] = False
+        self.arb.up("sleepy")
+        self.arb.sleep_model("sleepy")
+        with open(self.cfg.state_file) as fh:
+            saved = json.load(fh)
+        self.assertEqual(saved["slots"]["0"], "sleepy")
+        self.assertEqual(saved["active"], "sleepy")
+        status = self.arb.status()
+        self.assertEqual(status["cards"]["0"]["model"], "sleepy")
+        self.assertEqual(status["cards"]["0"]["background"], "stopped")
+
+    def test_new_model_retains_sleeping_process_that_freed_its_card(self):
+        self.cfg.models["smallA"].gpus = ["0"]
+        self.arb.up("sleepy")
+        self.arb.sleep_model("sleepy")
+        before = dict(self.state()["models"]["sleepy"])
+        started = self.host.started_at["cardshare-sleepy.service"]
+        calls = list(self.host.calls)
+        result = self.arb.up("smallA")
+        self.assertEqual(result["cards"], ["0"])
+        self.assertEqual(result["evicted"], [])
+        self.assertEqual(self.state()["models"]["sleepy"], before)
+        self.assertTrue(self.host.units["cardshare-sleepy.service"])
+        self.assertEqual(self.host.started_at["cardshare-sleepy.service"], started)
+        self.assertNotIn(("stop", "cardshare-sleepy.service"), self.host.calls[len(calls):])
+
+    def test_sleeping_model_that_holds_card_is_still_evicted(self):
+        self.cfg.models["smallA"].gpus = ["0"]
+        self.cfg.models["sleepy"].sleep["frees_card"] = False
+        self.arb.up("sleepy")
+        self.arb.sleep_model("sleepy")
+        result = self.arb.up("smallA")
+        self.assertEqual(result["evicted"], ["sleepy"])
+        self.assertNotIn("sleepy", self.state()["models"])
+        self.assertFalse(self.host.units["cardshare-sleepy.service"])
+
+    def test_sleeping_free_card_model_still_evicted_for_port_conflict(self):
+        self.cfg.models["smallA"].gpus = ["0"]
+        self.cfg.models["smallA"].ports = list(self.cfg.models["sleepy"].ports)
+        self.arb.up("sleepy")
+        self.arb.sleep_model("sleepy")
+        result = self.arb.up("smallA")
+        self.assertEqual(result["evicted"], ["sleepy"])
+        self.assertFalse(self.host.units["cardshare-sleepy.service"])
+
+    def test_sleeping_free_card_model_still_counts_toward_host_memory_limit(self):
+        self.cfg.host_mem_limit_gib = 15
+        self.cfg.models["sleepy"].host_mem_gib = 10
+        self.cfg.models["smallA"].host_mem_gib = 10
+        self.cfg.models["smallA"].gpus = ["0"]
+        self.arb.up("sleepy")
+        self.arb.sleep_model("sleepy")
+        result = self.arb.up("smallA")
+        self.assertEqual(result["evicted"], ["sleepy"])
+        self.assertFalse(self.host.units["cardshare-sleepy.service"])
+
+    def test_manual_sleep_rejects_active_request_before_backend_call(self):
+        self.arb.up("sleepy")
+        self.lease("sleepy", 1)
+        before = list(self.host.calls)
+        with self.assertRaisesRegex(ArbiterError, "busy"):
+            self.arb.sleep_model("sleepy")
+        self.assertNotIn("http://127.0.0.1:9300/sleep", self.host.http_posts)
+        self.assertEqual(self.host.calls, before)
+        self.assertFalse(self.state()["models"]["sleepy"]["asleep"])
+        self.assertTrue(self.host.units["cardshare-sleepy.service"])
+        self.assertFalse(self.bg(0))
+
+    def test_backend_busy_race_does_not_stop_model_or_start_background(self):
+        self.arb.up("sleepy")
+        original_http = self.host.http
+
+        def raced_http(method, url, **kwargs):
+            if method == "POST" and url.endswith("/sleep"):
+                return 409, {"status": "busy"}
+            return original_http(method, url, **kwargs)
+
+        self.host.http = raced_http
+        before = list(self.host.calls)
+        with self.assertRaisesRegex(ArbiterError, "busy"):
+            self.arb.sleep_model("sleepy")
+        self.assertEqual(self.host.calls, before)
+        self.assertTrue(self.host.units["cardshare-sleepy.service"])
+        self.assertFalse(self.state()["models"]["sleepy"]["asleep"])
+        self.assertFalse(self.bg(0))
+        # The same admission race during idle GC must also defer sleep safely.
+        self.host.advance(90)
+        self.arb.gc()
+        self.assertEqual(self.host.calls, before)
+        self.assertTrue(self.host.units["cardshare-sleepy.service"])
+        self.assertFalse(self.state()["models"]["sleepy"]["asleep"])
+        self.assertFalse(self.bg(0))
+
     def test_idle_sleeps_then_wakes(self):
         self.arb.up("sleepy")
         self.assertFalse(self.bg(0))

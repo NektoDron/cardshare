@@ -137,9 +137,7 @@ class Arbiter:
             mode = 0o644                        # status is read by unprivileged users and the gateway
         out = dict(st)
         slots = {c: None for c in self.cards()}
-        for n, rec in st["models"].items():
-            for c in rec["cards"]:
-                slots[c] = n
+        slots.update(self.occupied(st))
         out["slots"] = slots
         # read-only hint for older tools that knew a single "active" model
         out["active"] = next((slots[c] for c in sorted(slots) if slots[c]), None)
@@ -370,10 +368,7 @@ class Arbiter:
 
         now = self.host.now()
         others = {n: r for n, r in st["models"].items() if n != name}
-        occ = {}
-        for n, r in others.items():
-            for c in r["cards"]:
-                occ[c] = n
+        occ = {c: n for c, n in self.occupied(st).items() if n != name}
         model_of = lambda n: self.cfg.models.get(n)
         last = {n: self.last_used(n, r) for n, r in others.items()}
         busy_cache = {}
@@ -604,6 +599,9 @@ class Arbiter:
     def _sleep(self, st, name, m, rec):
         self.say("%s idle — putting it to sleep" % name)
         status, _ = self.host.http("POST", m.sleep["sleep_url"], timeout=m.sleep["timeout_sec"], body={})
+        if status == 409:
+            self.say("%s became busy — leaving it awake" % name)
+            return False
         if status != 200:
             self.say("%s did not go to sleep (HTTP %s) — stopping it" % (name, status))
             return self.release(st, name)
@@ -652,7 +650,10 @@ class Arbiter:
             if not rec or rec.get("asleep"):
                 self.say("%s is %s" % (name, "asleep already" if rec else "not up"))
                 return {"ok": True}
-            self._sleep(st, name, m, rec)
+            if self.busy(name, m, rec):
+                raise ArbiterError("%s is busy; cannot sleep while serving a request" % name)
+            if self._sleep(st, name, m, rec) is False:
+                raise ArbiterError("%s became busy; left awake" % name)
             self.save_state(st)
             return {"ok": True}
 
@@ -762,6 +763,9 @@ class Arbiter:
                         "held": self.held(c),
                         "background_downtime_last_hour_min": round(self.downtime_last_hour(st, c) / 60, 1)}
         models = {}
+        for c, n in self.occupied(st).items():
+            if c in cards:
+                cards[c]["model"] = n
         for n, rec in st["models"].items():
             m = self.cfg.models.get(n)
             inflight, _, _ = read_lease(self.cfg.run_dir, n, now, self.cfg.lease_stale_sec)
@@ -769,8 +773,5 @@ class Arbiter:
             models[n] = {"state": state, "cards": rec["cards"], "up_sec": int(now - (rec.get("since") or now)),
                          "idle_sec": int(now - self.last_used(n, rec)), "inflight": inflight,
                          "idle_minutes": self.idle_limit(n, m) / 60 if m else None}
-            for c in rec["cards"]:
-                if c in cards:
-                    cards[c]["model"] = n
         return {"cards": cards, "models": models, "budget_minutes_per_hour": self.cfg.budget_min,
                 "hold": os.path.exists(self.cfg.hold_file)}
