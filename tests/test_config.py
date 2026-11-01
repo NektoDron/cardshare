@@ -23,7 +23,22 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(m.api, ["openai", "anthropic", "responses"])
         self.assertEqual(m.ports, [9000])
         self.assertIsNone(m.sleep)
+        self.assertTrue(m.listed)
+        self.assertIsNone(m.context_window)
         self.assertEqual(c.gateway.port, 8100)
+
+    def test_unlisted_model_keeps_canonical_and_alias_routes(self):
+        c = cfg({"m": model(9000, listed=False, aliases=["alias"])})
+        self.assertFalse(c.models["m"].listed)
+        self.assertFalse(c.models["m"].hidden)
+        self.assertEqual(c.resolve("m"), ("m", None))
+        self.assertEqual(c.resolve("alias"), ("m", None))
+
+    def test_context_window_requires_positive_integer(self):
+        self.assertEqual(cfg({"m": model(9000, context_window=65536)}).models["m"].context_window, 65536)
+        for value in (None, False, True, 0, -1, "65536", 65536.0, [], {}):
+            with self.subTest(value=value), self.assertRaisesRegex(ConfigError, "context_window"):
+                cfg({"m": model(9000, context_window=value)})
 
     def test_defaults_section_and_env(self):
         c = cfg(defaults={"idle_minutes": 7})

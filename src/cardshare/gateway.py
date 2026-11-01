@@ -405,23 +405,28 @@ class Gateway:
         return out
 
     async def h_models(self, request):
-        entries = self._model_entries()
+        entries = [(n, m, meta) for n, m, meta in self._model_entries() if m.listed]
+        capacity = lambda m: {} if m.context_window is None else {"context_window": m.context_window}
         if "anthropic-version" in request.headers:
             data = [{"type": "model", "id": n, "display_name": m.desc or n,
-                     "created_at": "1970-01-01T00:00:00Z", "cardshare": meta} for n, m, meta in entries]
+                     "created_at": "1970-01-01T00:00:00Z", "cardshare": meta, **capacity(m)} for n, m, meta in entries]
             return web.json_response({"data": data, "has_more": False,
                                       "first_id": data[0]["id"] if data else None,
                                       "last_id": data[-1]["id"] if data else None})
         return web.json_response({"object": "list", "data": [
-            {"id": n, "object": "model", "created": 0, "owned_by": "cardshare", "cardshare": meta}
+            {"id": n, "object": "model", "created": 0, "owned_by": "cardshare", "cardshare": meta, **capacity(m)}
             for n, m, meta in entries]})
 
     async def h_model(self, request):
         want = request.match_info["id"]
         for n, m, meta in self._model_entries():
             if n == want:
+                capacity = {} if m.context_window is None else {"context_window": m.context_window}
+                if "anthropic-version" in request.headers:
+                    return web.json_response({"type": "model", "id": n, "display_name": m.desc or n,
+                                              "created_at": "1970-01-01T00:00:00Z", "cardshare": meta, **capacity})
                 return web.json_response({"id": n, "object": "model", "created": 0, "owned_by": "cardshare",
-                                          "cardshare": meta})
+                                          "cardshare": meta, **capacity})
         return error_response(404, "no model %r" % want, "anthropic-version" in request.headers,
                               code="model_not_found")
 

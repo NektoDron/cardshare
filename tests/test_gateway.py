@@ -210,6 +210,73 @@ class Basics(GatewayBase):
         self.assertEqual(r.status, 200)
         self.assertEqual(self.stubs["smallA"].requests[-1]["body"]["model"], "small-alias")
 
+    async def test_declared_context_available_offline_for_catalog_and_lookup(self):
+        self.cfg.models["bigA"].context_window = 65536
+        self.cfg.models["smallA"].context_window = 32768
+        self.cfg.models["smallA"].listed = False
+        self.cfg.gateway.list_aliases = True
+        calls_before = list(self.host.calls)
+
+        def no_backend_probe(*args, **kwargs):
+            self.fail("model discovery must not query or start a backend")
+
+        self.host.http = no_backend_probe
+        for headers in ({}, {"anthropic-version": "2023-06-01"}):
+            response = await self.client.get("/v1/models", headers=headers)
+            self.assertEqual(response.status, 200)
+            entries = {entry["id"]: entry for entry in (await response.json())["data"]}
+            for name in ("bigA", "deep"):
+                self.assertEqual(entries[name]["context_window"], 65536)
+            self.assertNotIn("context_window", entries["bigB"])
+            self.assertNotIn("smallA", entries)
+            for name, expected in (("bigA", 65536), ("deep", 65536), ("smallA", 32768), ("small-alias", 32768), ("bigB", None)):
+                response = await self.client.get("/v1/models/" + name, headers=headers)
+                self.assertEqual(response.status, 200)
+                entry = await response.json()
+                self.assertEqual(entry["id"], name)
+                if expected is None:
+                    self.assertNotIn("context_window", entry)
+                else:
+                    self.assertEqual(entry["context_window"], expected)
+                self.assertEqual(entry.get("type") if headers else entry.get("object"), "model")
+        self.assertEqual(self.host.calls, calls_before)
+        self.assertEqual(self.state()["models"], {})
+        st = self.gw.reader.load_state()
+        st["models"]["bigA"] = {"cards": ["0"], "asleep": True, "since": self.host.now()}
+        self.gw.reader.save_state(st)
+        for headers in ({}, {"anthropic-version": "2023-06-01"}):
+            entries = (await (await self.client.get("/v1/models", headers=headers)).json())["data"]
+            entry = next(item for item in entries if item["id"] == "bigA")
+            self.assertEqual(entry["cardshare"]["state"], "asleep")
+            self.assertEqual(entry["context_window"], 65536)
+        self.assertEqual(self.host.calls, calls_before)
+
+    async def test_unlisted_model_routes_without_appearing_in_catalog(self):
+        self.cfg.models["bigA"].listed = False
+        self.cfg.gateway.list_aliases = True
+        for headers in ({}, {"anthropic-version": "2023-06-01"}):
+            response = await self.client.get("/v1/models", headers=headers)
+            self.assertEqual(response.status, 200)
+            ids = {entry["id"] for entry in (await response.json())["data"]}
+            self.assertNotIn("bigA", ids)
+            self.assertNotIn("deep", ids)
+            self.assertIn("smallA", ids)  # listed defaults to true
+            self.assertIn("small-alias", ids)
+        response = await self.client.get("/v1/models/bigA")
+        self.assertEqual(response.status, 200)
+        for name, upstream in (("bigA", "bigA"), ("deep", "real-name")):
+            response = await self.chat(name)
+            self.assertEqual(response.status, 200)
+            self.assertEqual(self.stubs["bigA"].requests[-1]["body"]["model"], upstream)
+
+    async def test_hidden_model_still_rejects_generation(self):
+        self.cfg.models["bigA"].hidden = True
+        self.cfg.models["bigA"].listed = False
+        for name in ("bigA", "deep"):
+            response = await self.chat(name)
+            self.assertEqual(response.status, 404)
+        self.assertEqual(self.starts("bigA"), 0)
+
     async def test_status_endpoint(self):
         await self.chat("smallA")
         j = await (await self.client.get("/cardshare/status")).json()
