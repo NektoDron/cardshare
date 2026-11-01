@@ -443,7 +443,7 @@ class Gateway:
             rec["status"] = rec["status"] or resp.status
             return resp
         except asyncio.CancelledError:
-            rec["status"] = rec["status"] or 499
+            rec["status"] = 499
             raise
         finally:
             rec["duration_sec"] = round(loop.time() - t0, 3)
@@ -618,5 +618,8 @@ def run(cfg, host=None, port=None):
         log.warning(bar)
     log.info("cardshare gateway %s on %s:%d, %d models, arbiter %s", __version__, h, p,
              len(cfg.models), type(gw.arb).__name__)
-    web.run_app(gw.app(), host=h, port=p, print=None, handler_cancellation=False)
+    # Cancel a disconnected client even while waiting for the next upstream chunk.
+    # _proxy closes its response and _api releases its lease during cancellation;
+    # ensure_up shields the shared model-start task from an individual client.
+    web.run_app(gw.app(), host=h, port=p, print=None, handler_cancellation=True)
     return 0
